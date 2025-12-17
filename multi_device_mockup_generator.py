@@ -285,7 +285,7 @@ def wrap_text(text, font, max_width):
     words = text.split()
     lines = []
     current = ""
-    
+
     for word in words:
         test_line = word if not current else f"{current} {word}"
         if _text_width(font, test_line) <= max_width:
@@ -297,6 +297,104 @@ def wrap_text(text, font, max_width):
     if current:
         lines.append(current)
     return lines or [text]
+
+def auto_trim_whitespace(image, threshold=240, min_content_ratio=0.1):
+    """
+    Automatically detect and remove white/light borders from an image.
+
+    Args:
+        image: PIL Image object
+        threshold: Pixel brightness threshold (0-255). Pixels brighter than this
+                   are considered "white/background". Default 240 catches near-white.
+        min_content_ratio: Minimum ratio of content to keep (prevents over-trimming).
+                          Default 0.1 means at least 10% of original dimensions kept.
+
+    Returns:
+        Cropped PIL Image with white borders removed
+    """
+    # Convert to RGB if necessary (handles RGBA, P mode, etc.)
+    if image.mode == 'RGBA':
+        # Create white background and composite
+        background = Image.new('RGB', image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[3])  # Use alpha channel as mask
+        rgb_image = background
+    elif image.mode != 'RGB':
+        rgb_image = image.convert('RGB')
+    else:
+        rgb_image = image
+
+    # Get image dimensions
+    width, height = rgb_image.size
+    pixels = rgb_image.load()
+
+    # Find content boundaries by scanning for non-white pixels
+    def is_background_pixel(pixel):
+        """Check if a pixel is considered background (white/near-white)."""
+        r, g, b = pixel
+        return r >= threshold and g >= threshold and b >= threshold
+
+    def scan_for_content_row(y):
+        """Check if a row contains any content pixels."""
+        for x in range(width):
+            if not is_background_pixel(pixels[x, y]):
+                return True
+        return False
+
+    def scan_for_content_col(x):
+        """Check if a column contains any content pixels."""
+        for y in range(height):
+            if not is_background_pixel(pixels[x, y]):
+                return True
+        return False
+
+    # Find top boundary (first row with content)
+    top = 0
+    for y in range(height):
+        if scan_for_content_row(y):
+            top = y
+            break
+
+    # Find bottom boundary (last row with content)
+    bottom = height
+    for y in range(height - 1, -1, -1):
+        if scan_for_content_row(y):
+            bottom = y + 1
+            break
+
+    # Find left boundary (first column with content)
+    left = 0
+    for x in range(width):
+        if scan_for_content_col(x):
+            left = x
+            break
+
+    # Find right boundary (last column with content)
+    right = width
+    for x in range(width - 1, -1, -1):
+        if scan_for_content_col(x):
+            right = x + 1
+            break
+
+    # Calculate minimum dimensions to prevent over-trimming
+    min_width = int(width * min_content_ratio)
+    min_height = int(height * min_content_ratio)
+
+    # Validate boundaries
+    content_width = right - left
+    content_height = bottom - top
+
+    # If content area is too small, it might be an error - return original
+    if content_width < min_width or content_height < min_height:
+        return image
+
+    # If no trimming needed, return original
+    if left == 0 and top == 0 and right == width and bottom == height:
+        return image
+
+    # Crop the original image (not the RGB converted one) to preserve transparency
+    cropped = image.crop((left, top, right, bottom))
+
+    return cropped
 
 def resize_screenshot_to_fit(screenshot, target_width, target_height, fit_mode='contain', filename=""):
     """
@@ -549,44 +647,54 @@ def apply_instagram_story_overlay(image, screen_coords, device_config):
     draw.line(arrow_points, fill=(255, 255, 255, 220), width=4)
     draw.line([(icon_x, arrow_center_y + arrow_height), (icon_x, arrow_center_y + arrow_height + icon_radius)], fill=(255, 255, 255, 220), width=4)
 
-def process_all_screenshots(input_folder='./screenshots', output_folder='./mockups', device_type='iphone14', skip_existing=True):
+def process_all_screenshots(input_folder='./screenshots', output_folder='./mockups', device_type='iphone14', skip_existing=True, auto_trim=True):
     """
     Process all screenshots in the input folder and create mockups
+
+    Args:
+        input_folder: Path to folder containing screenshots
+        output_folder: Path to save generated mockups
+        device_type: Device frame to use (e.g., 'iphone14', 'macbook14')
+        skip_existing: Skip screenshots that already have mockups
+        auto_trim: Automatically remove white/light borders from screenshots
     """
     # Validate device type
     if device_type not in DEVICES:
         print(f"❌ Invalid device type: '{device_type}'")
         print(f"   Available devices: {', '.join(DEVICES.keys())}")
         return
-    
+
     # Create output folder if it doesn't exist
     Path(output_folder).mkdir(parents=True, exist_ok=True)
-    
+
     # Supported image formats
     supported_formats = ('.png', '.jpg', '.jpeg', '.webp')
-    
+
     # Get all image files from input folder
-    screenshot_files = [f for f in os.listdir(input_folder) 
+    screenshot_files = [f for f in os.listdir(input_folder)
                        if f.lower().endswith(supported_formats)]
-    
+
     if not screenshot_files:
         print(f"❌ No image files found in '{input_folder}'")
         print(f"   Supported formats: {', '.join(supported_formats)}")
         return
-    
+
     device_name = DEVICES[device_type]['name']
     print(f"📱 Found {len(screenshot_files)} screenshot(s) to process...")
     print(f"🖥️  Device: {device_name}")
+    if auto_trim:
+        print("✂️  Auto-trim: ON (removing white borders)")
     if skip_existing:
         print("⏭️  Skipping screenshots with existing mockups.")
     print("-" * 50)
-    
+
     # Create device frame template
     frame_template, screen_coords, device_config = create_device_frame(device_type)
-    
+
     # Process each screenshot
     processed_count = 0
     skipped_count = 0
+    trimmed_count = 0
 
     for idx, filename in enumerate(screenshot_files, 1):
         try:
@@ -599,12 +707,23 @@ def process_all_screenshots(input_folder='./screenshots', output_folder='./mocku
                 skipped_count += 1
                 print(f"   Skipping existing mockup: {output_filename}")
                 continue
-            
+
             # Load screenshot
             screenshot = Image.open(input_path)
-            
-            print(f"   Processing: {screenshot.size[0]}x{screenshot.size[1]} pixels")
-            
+            original_size = screenshot.size
+
+            # Auto-trim white borders if enabled
+            if auto_trim:
+                screenshot = auto_trim_whitespace(screenshot)
+                trimmed_size = screenshot.size
+                if trimmed_size != original_size:
+                    trimmed_count += 1
+                    print(f"   ✂️  Trimmed: {original_size[0]}x{original_size[1]} → {trimmed_size[0]}x{trimmed_size[1]}")
+                else:
+                    print(f"   Processing: {screenshot.size[0]}x{screenshot.size[1]} pixels")
+            else:
+                print(f"   Processing: {screenshot.size[0]}x{screenshot.size[1]} pixels")
+
             # Add to frame
             mockup = add_screenshot_to_frame(
                 frame_template,
@@ -613,18 +732,20 @@ def process_all_screenshots(input_folder='./screenshots', output_folder='./mocku
                 device_config,
                 filename
             )
-            
+
             # Save mockup
             mockup.save(output_path, 'PNG')
-            
+
             processed_count += 1
             print(f"✅ [{idx}/{len(screenshot_files)}] {filename} → {output_filename}")
-            
+
         except Exception as e:
             print(f"❌ [{idx}/{len(screenshot_files)}] Error processing {filename}: {str(e)}")
     
     print("-" * 50)
     summary_parts = [f"{processed_count} new mockup(s)"]
+    if trimmed_count:
+        summary_parts.append(f"{trimmed_count} trimmed")
     if skipped_count:
         summary_parts.append(f"{skipped_count} skipped")
     print(f"🎉 Done! {' | '.join(summary_parts)} saved to '{output_folder}'")
@@ -634,23 +755,26 @@ if __name__ == "__main__":
     print("Multi-Device Mockup Generator")
     print("=" * 50)
     print()
-    
+
     # CONFIGURATION - CHANGE THESE AS NEEDED
     INPUT_FOLDER = './screenshots'
     OUTPUT_FOLDER = './mockups'
-    
+
     DEFAULT_DEVICE = 'iphone14'
     selected_device = prompt_for_device(DEFAULT_DEVICE)
+    auto_trim = prompt_yes_no("Auto-trim white borders from screenshots?", default=True)
     skip_existing = prompt_yes_no("Skip screenshots that already have mockups?", default=True)
-    
+
+    print()
     print(f"📂 Input folder: {INPUT_FOLDER}")
     print(f"📂 Output folder: {OUTPUT_FOLDER}")
     print(f"🖥️  Device: {DEVICES[selected_device]['name']}")
+    print(f"✂️  Auto-trim: {'Yes' if auto_trim else 'No'}")
     print(f"⏭️  Skip existing: {'Yes' if skip_existing else 'No'}")
     print()
-    
+
     # Create input folder if it doesn't exist
     Path(INPUT_FOLDER).mkdir(parents=True, exist_ok=True)
-    
+
     # Process all screenshots
-    process_all_screenshots(INPUT_FOLDER, OUTPUT_FOLDER, selected_device, skip_existing=skip_existing)
+    process_all_screenshots(INPUT_FOLDER, OUTPUT_FOLDER, selected_device, skip_existing=skip_existing, auto_trim=auto_trim)
